@@ -1,0 +1,32 @@
+---
+enhancements:
+  - |
+    An SBOM scan with application analyzers, such as ``languages``, that runs
+    out of time now reports the OS packages alone, marked with the
+    ``datadog:scan:OSFallback`` metadata property. The rescan gets two more
+    minutes past the scan timeout. Container image and ECS Fargate scans then
+    retry the full scan as after a failure, and host scans at their next
+    periodic refresh.
+  - |
+    Host SBOM scans, and container scans on ECS Fargate, take their timeout
+    from the new ``sbom.host.scan_timeout`` setting, 600 seconds by default.
+    They stopped after 30 seconds.
+fixes:
+  - |
+    Fixed an Agent crash when an SBOM scan with the ``languages`` analyzer
+    reads a ``pyproject.toml`` whose Poetry group declares no dependencies.
+  - |
+    Fixed SBOM scans with the ``languages`` analyzer failing on a file that
+    denies the Agent read access, and running for minutes on hosts with many
+    files installed by OS packages.
+  - |
+    Fixed SBOM scans with the ``os`` analyzer alone missing packages when
+    ``sbom.host.additional_directories`` or
+    ``sbom.container_image.additional_directories`` is set.
+  - |
+    Fixed SBOM scans of container images exported to a tarball reading every
+    layer to its end after running out of time.
+  - |
+    Fixed every container image SBOM scan failing at once when
+    ``sbom.container_image.scan_timeout`` is negative. A negative value now
+    means 30 seconds, as zero does.

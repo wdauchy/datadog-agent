@@ -286,8 +286,10 @@ func (s *Scanner) processScan(ctx context.Context, request sbom.ScanRequest, img
 		result = s.PerformScan(scanContext, request, collector)
 		errorType = "scan"
 	}
+	// Read the report before sendResult hands it to the collector's consumer.
+	osFallback := result.Error == nil && result.Report != nil && sbom.IsOSFallback(result.Report.ToCycloneDX())
 	sendResult(ctx, request.ID(), result, collector)
-	s.handleScanResult(result, collector, request, errorType)
+	s.handleScanResult(result, collector, request, errorType, osFallback)
 	waitAfterScanIfNecessary(ctx, collector)
 }
 
@@ -321,7 +323,9 @@ func (s *Scanner) PerformScan(ctx context.Context, request sbom.ScanRequest, col
 	return &scanResult
 }
 
-func (s *Scanner) handleScanResult(scanResult *sbom.ScanResult, collector collectors.Collector, request sbom.ScanRequest, errorType string) {
+// handleScanResult counts scanResult and retries request when it failed or
+// lists the OS packages alone, as osFallback reports.
+func (s *Scanner) handleScanResult(scanResult *sbom.ScanResult, collector collectors.Collector, request sbom.ScanRequest, errorType string, osFallback bool) {
 	if scanResult == nil {
 		telemetry.SBOMFailures.Inc(request.Collector(), request.Type(collector.Options()), "nil_scan_result")
 		log.Errorf("nil scan result for '%s'", request.ID())
@@ -341,6 +345,16 @@ func (s *Scanner) handleScanResult(scanResult *sbom.ScanResult, collector collec
 	}
 
 	telemetry.SBOMGenerationDuration.Observe(scanResult.Duration.Seconds(), request.Collector(), request.Type(collector.Options()))
+	if osFallback {
+		telemetry.SBOMOSFallbacks.Inc(request.Collector(), request.Type(collector.Options()))
+		// Retry the full scan with the backoff of a failure. The host scan
+		// waits for its periodic refresh: each retry would hold the scan worker
+		// for its whole timeout.
+		if collector.Type() != collectors.HostScanType {
+			s.scanQueue.AddRateLimited(request)
+			return
+		}
+	}
 	s.scanQueue.Forget(request)
 }
 
@@ -358,9 +372,15 @@ func waitAfterScanIfNecessary(ctx context.Context, collector collectors.Collecto
 }
 
 func timeout(collector collectors.Collector) time.Duration {
-	scanTimeout := collector.Options().Timeout
-	if scanTimeout == 0 {
+	opts := collector.Options()
+	scanTimeout := opts.Timeout
+	if scanTimeout <= 0 {
 		scanTimeout = defaultScanTimeout
+	}
+	// The reserve past Timeout is for the OS-only fallback of a scan with
+	// application analyzers that runs out of time.
+	if !opts.OSOnly() {
+		scanTimeout += sbom.OSFallbackTimeout
 	}
 	return scanTimeout
 }

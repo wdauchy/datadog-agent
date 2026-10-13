@@ -162,3 +162,59 @@ func TestConvertScanResultToSBOMErrorLogging(t *testing.T) {
 		})
 	}
 }
+
+func TestScanOptionsOSOnly(t *testing.T) {
+	tests := []struct {
+		name      string
+		analyzers []string
+		want      bool
+	}{
+		{name: "nil", want: false},
+		{name: "empty", analyzers: []string{}, want: false},
+		{name: "os", analyzers: []string{"os"}, want: true},
+		{name: "os twice", analyzers: []string{"os", "os"}, want: false},
+		{name: "languages", analyzers: []string{"languages"}, want: false},
+		{name: "os and languages", analyzers: []string{"os", "languages"}, want: false},
+		{name: "upper case", analyzers: []string{"OS"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ScanOptions{Analyzers: tt.analyzers}.OSOnly())
+		})
+	}
+}
+
+func TestIsOSFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		bom  *cyclonedx_v1_4.Bom
+		want bool
+	}{
+		{
+			name: "nil bom",
+		},
+		{
+			name: "no metadata",
+			bom:  &cyclonedx_v1_4.Bom{Components: []*cyclonedx_v1_4.Component{component("bash")}},
+		},
+		{
+			name: "fallback",
+			bom: &cyclonedx_v1_4.Bom{Metadata: &cyclonedx_v1_4.Metadata{Properties: []*cyclonedx_v1_4.Property{
+				property(UsageObservedSinceProperty, "1700000000"),
+				property(OSFallbackProperty, "true"),
+			}}},
+			want: true,
+		},
+		{
+			name: "another value",
+			bom: &cyclonedx_v1_4.Bom{Metadata: &cyclonedx_v1_4.Metadata{Properties: []*cyclonedx_v1_4.Property{
+				property(OSFallbackProperty, "false"),
+			}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, IsOSFallback(tt.bom))
+		})
+	}
+}

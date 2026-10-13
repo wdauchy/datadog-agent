@@ -9,17 +9,25 @@
 package trivy
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/aquasecurity/trivy/pkg/fanal/artifact"
+	"github.com/aquasecurity/trivy/pkg/types"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/DataDog/datadog-agent/pkg/sbom"
+	"github.com/DataDog/ddtrivy"
 )
 
 // TestExtractLayersFromOverlayFSMounts checks if the function correctly extracts layer paths from Mount options.
@@ -145,4 +153,339 @@ func TestScanFilesystemLicenseFile(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "the SBOM lacks the example package")
+}
+
+func TestGetDefaultArtifactOption(t *testing.T) {
+	tests := []struct {
+		name      string
+		analyzers []string
+		want      artifact.Option
+	}{
+		{
+			name:      "os",
+			analyzers: []string{OSAnalyzers},
+			want:      ddtrivy.TrivyOptionsOS(1),
+		},
+		{
+			name:      "os and languages",
+			analyzers: []string{OSAnalyzers, LanguagesAnalyzers},
+			want:      ddtrivy.TrivyOptionsAll(1),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getDefaultArtifactOption(sbom.ScanOptions{Analyzers: tt.analyzers})
+			assert.ElementsMatch(t, tt.want.DisabledAnalyzers, got.DisabledAnalyzers)
+			assert.Equal(t, tt.want.AnalyzerTimeout, got.AnalyzerTimeout)
+			assert.Equal(t, tt.want.PostAnalyzerTimeout, got.PostAnalyzerTimeout)
+			assert.True(t, got.OfflineJar)
+		})
+	}
+
+	t.Run("os with additional directories", func(t *testing.T) {
+		got := getDefaultArtifactOption(sbom.ScanOptions{Analyzers: []string{OSAnalyzers}, AdditionalDirs: []string{"srv/app/**"}})
+		assert.Empty(t, got.WalkerOption.OnlyDirs)
+	})
+}
+
+func TestScanWithOSFallback(t *testing.T) {
+	osReport := &types.Report{ArtifactName: "os"}
+	appReport := &types.Report{ArtifactName: "app"}
+	errScan := errors.New("scan failed")
+
+	// Each scan step plays one call to scan.
+	finish := func(report *types.Report) func(context.Context) (*types.Report, error) {
+		return func(context.Context) (*types.Report, error) { return report, nil }
+	}
+	fail := func(err error) func(context.Context) (*types.Report, error) {
+		return func(context.Context) (*types.Report, error) { return nil, err }
+	}
+	// block runs until the context is done.
+	block := func(ctx context.Context) (*types.Report, error) {
+		<-ctx.Done()
+		return nil, fmt.Errorf("walk dir error: %w", ctx.Err())
+	}
+	// blockFail runs until the context is done and fails with an error
+	// that wraps no context error.
+	blockFail := func(ctx context.Context) (*types.Report, error) {
+		<-ctx.Done()
+		return nil, errScan
+	}
+	// overrun runs past the wall, ignoring the context.
+	overrun := func(context.Context) (*types.Report, error) {
+		time.Sleep(13 * time.Minute)
+		return nil, errScan
+	}
+
+	type call struct {
+		left      time.Duration // time to the deadline as the call starts, 0 without one
+		analyzers []string      // analyzers the call's options come from
+	}
+	app := []string{OSAnalyzers, LanguagesAnalyzers}
+	osOnly := []string{OSAnalyzers}
+	tests := []struct {
+		name         string
+		analyzers    []string
+		timeout      time.Duration // 0 for no deadline
+		cancel       bool          // cancel the context in the first call
+		scans        []func(context.Context) (*types.Report, error)
+		want         *types.Report
+		wantFallback bool
+		wantErr      error
+		wantCalls    []call
+	}{
+		{
+			name:      "os only",
+			analyzers: osOnly,
+			timeout:   10 * time.Minute,
+			scans:     []func(context.Context) (*types.Report, error){finish(osReport)},
+			want:      osReport,
+			wantCalls: []call{{left: 10 * time.Minute, analyzers: osOnly}},
+		},
+		{
+			name:      "os only without a deadline",
+			analyzers: osOnly,
+			scans:     []func(context.Context) (*types.Report, error){finish(osReport)},
+			want:      osReport,
+			wantCalls: []call{{analyzers: osOnly}},
+		},
+		{
+			name:      "no deadline",
+			analyzers: app,
+			scans:     []func(context.Context) (*types.Report, error){finish(appReport)},
+			want:      appReport,
+			wantCalls: []call{{analyzers: app}},
+		},
+		{
+			name:      "application scan finishes",
+			analyzers: app,
+			timeout:   12 * time.Minute,
+			scans:     []func(context.Context) (*types.Report, error){finish(appReport)},
+			want:      appReport,
+			wantCalls: []call{{left: 10 * time.Minute, analyzers: app}},
+		},
+		{
+			name:         "application scan runs out of time",
+			analyzers:    app,
+			timeout:      12 * time.Minute,
+			scans:        []func(context.Context) (*types.Report, error){block, finish(osReport)},
+			want:         osReport,
+			wantFallback: true,
+			wantCalls:    []call{{left: 10 * time.Minute, analyzers: app}, {left: 2 * time.Minute, analyzers: osOnly}},
+		},
+		{
+			name:         "application scan runs out of time with another error",
+			analyzers:    app,
+			timeout:      12 * time.Minute,
+			scans:        []func(context.Context) (*types.Report, error){blockFail, finish(osReport)},
+			want:         osReport,
+			wantFallback: true,
+			wantCalls:    []call{{left: 10 * time.Minute, analyzers: app}, {left: 2 * time.Minute, analyzers: osOnly}},
+		},
+		{
+			name:      "OS rescan fails",
+			analyzers: app,
+			timeout:   12 * time.Minute,
+			scans:     []func(context.Context) (*types.Report, error){block, fail(errScan)},
+			wantErr:   errScan,
+			wantCalls: []call{{left: 10 * time.Minute, analyzers: app}, {left: 2 * time.Minute, analyzers: osOnly}},
+		},
+		{
+			name:      "application scan fails",
+			analyzers: app,
+			timeout:   12 * time.Minute,
+			scans:     []func(context.Context) (*types.Report, error){fail(errScan)},
+			wantErr:   errScan,
+			wantCalls: []call{{left: 10 * time.Minute, analyzers: app}},
+		},
+		{
+			name:      "application scan overruns the wall",
+			analyzers: app,
+			timeout:   12 * time.Minute,
+			scans:     []func(context.Context) (*types.Report, error){overrun},
+			wantErr:   errScan,
+			wantCalls: []call{{left: 10 * time.Minute, analyzers: app}},
+		},
+		{
+			name:      "cancelled",
+			analyzers: app,
+			timeout:   12 * time.Minute,
+			cancel:    true,
+			scans:     []func(context.Context) (*types.Report, error){block},
+			wantErr:   context.Canceled,
+			wantCalls: []call{{left: 10 * time.Minute, analyzers: app}},
+		},
+		{
+			name:         "exactly the reserve left",
+			analyzers:    app,
+			timeout:      2 * time.Minute,
+			scans:        []func(context.Context) (*types.Report, error){finish(osReport)},
+			want:         osReport,
+			wantFallback: true,
+			wantCalls:    []call{{left: 2 * time.Minute, analyzers: osOnly}},
+		},
+		{
+			name:         "less time left than the reserve",
+			analyzers:    app,
+			timeout:      time.Minute,
+			scans:        []func(context.Context) (*types.Report, error){finish(osReport)},
+			want:         osReport,
+			wantFallback: true,
+			wantCalls:    []call{{left: time.Minute, analyzers: osOnly}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				if tt.timeout > 0 {
+					var cancelTimeout context.CancelFunc
+					ctx, cancelTimeout = context.WithTimeout(ctx, tt.timeout)
+					defer cancelTimeout()
+				}
+
+				var calls []call
+				var options []artifact.Option
+				report, osFallback, err := scanWithOSFallback(ctx, "target", sbom.ScanOptions{Analyzers: tt.analyzers}, func(ctx context.Context, option artifact.Option) (*types.Report, error) {
+					var left time.Duration
+					if deadline, ok := ctx.Deadline(); ok {
+						left = time.Until(deadline)
+					}
+					calls = append(calls, call{left: left})
+					options = append(options, option)
+					if len(calls) > len(tt.scans) {
+						t.Fatalf("scan called %d times, want at most %d", len(calls), len(tt.scans))
+					}
+					if tt.cancel {
+						cancel()
+					}
+					return tt.scans[len(calls)-1](ctx)
+				})
+
+				assert.Equal(t, tt.want, report)
+				assert.Equal(t, tt.wantFallback, osFallback, "OS fallback")
+				if tt.wantErr != nil {
+					assert.ErrorIs(t, err, tt.wantErr)
+				} else {
+					assert.NoError(t, err)
+				}
+				require.Len(t, calls, len(tt.wantCalls))
+				for i, want := range tt.wantCalls {
+					assert.Equal(t, want.left, calls[i].left, "call %d: time to the deadline", i)
+					wantOption := getDefaultArtifactOption(sbom.ScanOptions{Analyzers: want.analyzers})
+					assert.ElementsMatch(t, wantOption.DisabledAnalyzers, options[i].DisabledAnalyzers, "call %d: disabled analyzers", i)
+					// The deadline alone bounds a scan that has one.
+					if tt.timeout > 0 {
+						wantOption.AnalyzerTimeout, wantOption.PostAnalyzerTimeout = 0, 0
+					}
+					assert.Equal(t, wantOption.AnalyzerTimeout, options[i].AnalyzerTimeout, "call %d: analyzer timeout", i)
+					assert.Equal(t, wantOption.PostAnalyzerTimeout, options[i].PostAnalyzerTimeout, "call %d: post-analyzer timeout", i)
+				}
+			})
+		})
+	}
+}
+
+// TestScanFilesystemOSFallback scans a root holding an apk package and an npm
+// package with the application analyzers. Without a deadline, or with time to
+// spare, the scan lists both. With less time left than the reserve, only the OS
+// scan runs: it lists the apk package alone and marks the SBOM as a fallback.
+func TestScanFilesystemOSFallback(t *testing.T) {
+	root := t.TempDir()
+	for name, data := range map[string]string{
+		"etc/os-release":                         "ID=alpine\nVERSION_ID=3.20.0\n",
+		"lib/apk/db/installed":                   "P:musl\nV:1.2.5-r0\nA:x86_64\no:musl\n\n",
+		"app/node_modules/left-pad/package.json": `{"name": "left-pad", "version": "1.3.0"}`,
+	} {
+		path := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(data), 0o644))
+	}
+
+	tests := []struct {
+		name         string
+		timeout      time.Duration // 0 for no deadline
+		want         []string      // purl types
+		wantFallback bool
+	}{
+		{
+			name: "no deadline",
+			want: []string{"apk", "npm"},
+		},
+		{
+			name:    "time to spare",
+			timeout: 10 * time.Minute,
+			want:    []string{"apk", "npm"},
+		},
+		{
+			name:         "less time left than the reserve",
+			timeout:      time.Minute,
+			want:         []string{"apk"},
+			wantFallback: true,
+		},
+	}
+	c := NewCollectorForCLI()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			if tt.timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tt.timeout)
+				defer cancel()
+			}
+
+			report, err := c.ScanFilesystem(ctx, root, sbom.ScanOptions{Analyzers: []string{OSAnalyzers, LanguagesAnalyzers}}, true)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantFallback, sbom.IsOSFallback(report.ToCycloneDX()), "OS fallback")
+
+			var got []string
+			for _, component := range report.ToCycloneDX().GetComponents() {
+				if purlType, _, ok := strings.Cut(strings.TrimPrefix(component.GetPurl(), "pkg:"), "/"); ok {
+					got = append(got, purlType)
+				}
+			}
+			slices.Sort(got)
+			assert.Equal(t, tt.want, slices.Compact(got))
+		})
+	}
+}
+
+// TestScanFilesystemOSFallbackID scans a root whose packages all come from the
+// OS, so a full scan and a fallback list the same results. Their report IDs
+// differ, for the sbom check to send the full scan in full after the fallback
+// rather than as a heartbeat.
+func TestScanFilesystemOSFallbackID(t *testing.T) {
+	root := t.TempDir()
+	for name, data := range map[string]string{
+		"etc/os-release":       "ID=alpine\nVERSION_ID=3.20.0\n",
+		"lib/apk/db/installed": "P:musl\nV:1.2.5-r0\nA:x86_64\no:musl\n\n",
+	} {
+		path := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(data), 0o644))
+	}
+
+	c := NewCollectorForCLI()
+	scan := func(timeout time.Duration) *Report {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		report, err := c.ScanFilesystem(ctx, root, sbom.ScanOptions{Analyzers: []string{OSAnalyzers, LanguagesAnalyzers}}, true)
+		require.NoError(t, err)
+		return report
+	}
+	full := scan(10 * time.Minute)
+	fallback := scan(time.Minute)
+	require.False(t, sbom.IsOSFallback(full.ToCycloneDX()))
+	require.True(t, sbom.IsOSFallback(fallback.ToCycloneDX()))
+	purls := func(report *Report) []string {
+		var purls []string
+		for _, component := range report.ToCycloneDX().GetComponents() {
+			purls = append(purls, component.GetPurl())
+		}
+		slices.Sort(purls)
+		return purls
+	}
+	assert.Equal(t, purls(full), purls(fallback), "the scans list different packages")
+	assert.NotEqual(t, full.ID(), fallback.ID())
 }

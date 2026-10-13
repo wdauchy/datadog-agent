@@ -63,10 +63,14 @@ var _ sbom.ScanRequest = (*scanRequest)(nil)
 type mockReport struct {
 	id   string
 	tags []string
+	bom  *cyclonedx_v1_4.Bom
 }
 
-// ToCycloneDX returns a mock BOM
+// ToCycloneDX returns bom, or an empty BOM without one
 func (m mockReport) ToCycloneDX() *cyclonedx_v1_4.Bom {
+	if m.bom != nil {
+		return m.bom
+	}
 	return &cyclonedx_v1_4.Bom{}
 }
 
@@ -255,6 +259,97 @@ func TestRetryLogic_NotSupported(t *testing.T) {
 	mockCollector.AssertNumberOfCalls(t, "Scan", 1)
 }
 
+// TestRetryLogic_OSFallback checks that a scan listing the OS packages alone
+// is delivered and then retried, except the host scan, which waits for its
+// periodic refresh.
+func TestRetryLogic_OSFallback(t *testing.T) {
+	workloadmetaStore := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
+		fx.Provide(func() log.Component { return logmock.New(t) }),
+		fx.Provide(func() compConfig.Component { return compConfig.NewMock(t) }),
+		fx.Supply(context.Background()),
+		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
+	))
+
+	imageID := "id"
+	workloadmetaStore.Set(&workloadmeta.ContainerImageMetadata{
+		EntityID: workloadmeta.EntityID{
+			ID:   imageID,
+			Kind: workloadmeta.KindContainerImageMetadata,
+		},
+	})
+
+	value := "true"
+	fallbackBOM := &cyclonedx_v1_4.Bom{Metadata: &cyclonedx_v1_4.Metadata{
+		Properties: []*cyclonedx_v1_4.Property{{Name: sbom.OSFallbackProperty, Value: &value}},
+	}}
+
+	for _, tt := range []struct {
+		name        string
+		st          collectors.ScanType
+		wantRetried bool
+	}{
+		{
+			name:        "container image scan",
+			st:          collectors.ContainerImageScanType,
+			wantRetried: true,
+		},
+		{
+			name:        "procfs scan",
+			st:          collectors.ProcfsCollector,
+			wantRetried: true,
+		},
+		{
+			name: "host scan",
+			st:   collectors.HostScanType,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := configmock.New(t)
+			collName := "mock"
+			mockCollector := collectors.NewMockCollector()
+			resultCh := make(chan sbom.ScanResult, 1)
+			fallbackResult := sbom.ScanResult{Report: mockReport{id: imageID, bom: fallbackBOM}}
+			fullResult := sbom.ScanResult{Report: mockReport{id: imageID}}
+			mockCollector.On("Options").Return(sbom.ScanOptions{})
+			mockCollector.On("Scan", mock.Anything, mock.Anything).Return(fallbackResult).Once()
+			mockCollector.On("Scan", mock.Anything, mock.Anything).Return(fullResult).Once()
+			mockCollector.On("Channel").Return(resultCh)
+			shutdown := mockCollector.On("Shutdown")
+			shutdown.After(5 * time.Second)
+			mockCollector.On("Type").Return(tt.st)
+
+			// Keep the backoff short so that the retry shows up quickly.
+			cfg.Set("sbom.scan_queue.base_backoff", "200ms", model.SourceAgentRuntime)
+			cfg.Set("sbom.scan_queue.max_backoff", "600ms", model.SourceAgentRuntime)
+
+			scanner := NewScanner(cfg, map[string]collectors.Collector{collName: mockCollector}, option.New[workloadmeta.Component](workloadmetaStore))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			scanner.Start(ctx)
+
+			err := scanner.Scan(sbom.ScanRequest(&scanRequest{collectorName: collName, id: imageID, scanRequestType: sbom.ScanFilesystemType}))
+			assert.NoError(t, err)
+
+			res := <-resultCh
+			assert.Equal(t, fallbackResult.Report, res.Report)
+			if tt.wantRetried {
+				select {
+				case res := <-resultCh:
+					assert.Equal(t, fullResult.Report, res.Report)
+				case <-time.After(5 * time.Second):
+					t.Fatal("the scan listing the OS packages alone was not retried")
+				}
+			}
+
+			select {
+			case res := <-resultCh:
+				t.Errorf("unexpected result received %v", res)
+			case <-time.After(time.Second):
+			}
+		})
+	}
+}
+
 func TestRetryLogic_ImageDeleted(t *testing.T) {
 	cfg := configmock.New(t)
 
@@ -413,4 +508,66 @@ sbom:
 		cfg := configmock.New(t)
 		assert.Equal(t, []string{"sbom.cache.max_disk_size"}, configuredDeprecatedSettings(cfg))
 	})
+}
+
+func TestTimeout(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		options func(compConfig.Component) sbom.ScanOptions
+		want    time.Duration
+	}{
+		{
+			name:    "host",
+			options: sbom.ScanOptionsFromConfigForHosts,
+			want:    10 * time.Minute,
+		},
+		{
+			name:    "host with languages",
+			yaml:    "sbom: {host: {analyzers: [os, languages]}}",
+			options: sbom.ScanOptionsFromConfigForHosts,
+			want:    12 * time.Minute,
+		},
+		{
+			name:    "host with languages and a zero timeout",
+			yaml:    "sbom: {host: {analyzers: [os, languages], scan_timeout: 0}}",
+			options: sbom.ScanOptionsFromConfigForHosts,
+			want:    defaultScanTimeout + sbom.OSFallbackTimeout,
+		},
+		{
+			name:    "host with languages and a negative timeout",
+			yaml:    "sbom: {host: {analyzers: [os, languages], scan_timeout: -1}}",
+			options: sbom.ScanOptionsFromConfigForHosts,
+			want:    defaultScanTimeout + sbom.OSFallbackTimeout,
+		},
+		{
+			name:    "container image",
+			options: sbom.ScanOptionsFromConfigForContainers,
+			want:    10 * time.Minute,
+		},
+		{
+			name:    "container image with languages",
+			yaml:    "sbom: {container_image: {analyzers: [os, languages]}}",
+			options: sbom.ScanOptionsFromConfigForContainers,
+			want:    12 * time.Minute,
+		},
+		{
+			name:    "container image with a negative timeout",
+			yaml:    "sbom: {container_image: {scan_timeout: -1}}",
+			options: sbom.ScanOptionsFromConfigForContainers,
+			want:    defaultScanTimeout,
+		},
+		{
+			name:    "zero options",
+			options: func(compConfig.Component) sbom.ScanOptions { return sbom.ScanOptions{} },
+			want:    defaultScanTimeout + sbom.OSFallbackTimeout,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockCollector := collectors.NewMockCollector()
+			mockCollector.On("Options").Return(tt.options(configmock.NewFromYAML(t, tt.yaml)))
+			assert.Equal(t, tt.want, timeout(mockCollector))
+		})
+	}
 }

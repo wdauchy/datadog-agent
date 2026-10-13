@@ -15,6 +15,7 @@ import (
 
 	cdx "github.com/CycloneDX/cyclonedx-go"
 	"github.com/DataDog/agent-payload/v5/cyclonedx_v1_4"
+	"github.com/DataDog/datadog-agent/pkg/sbom"
 	"github.com/DataDog/datadog-agent/pkg/sbom/bomconvert"
 	"github.com/aquasecurity/trivy/pkg/sbom/cyclonedx"
 	"github.com/aquasecurity/trivy/pkg/types"
@@ -31,6 +32,7 @@ type Report struct {
 type reportOptions struct {
 	dependencies    bool
 	simplifyBomRefs bool
+	osFallback      bool // the report lists the OS packages alone because the application scan ran out of time
 }
 
 func newReport(id string, report *types.Report, marshaler cyclonedx.Marshaler, opts reportOptions) (*Report, error) {
@@ -44,6 +46,9 @@ func newReport(id string, report *types.Report, marshaler cyclonedx.Marshaler, o
 	}
 
 	appendSBOMImageCreated(bom, report.Metadata.ImageConfig.Created.Time)
+	if opts.osFallback {
+		appendSBOMOSFallback(bom)
+	}
 
 	bom14 := bomconvert.ConvertBOM(bom, opts.simplifyBomRefs)
 
@@ -66,6 +71,20 @@ func appendSBOMImageCreated(bom *cdx.BOM, created time.Time) {
 	*c.Properties = append(*c.Properties, cdx.Property{
 		Name:  imageCreatedPropertyKey,
 		Value: created.UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// appendSBOMOSFallback marks the SBOM as listing the OS packages alone.
+func appendSBOMOSFallback(bom *cdx.BOM) {
+	if bom.Metadata == nil {
+		bom.Metadata = &cdx.Metadata{}
+	}
+	if bom.Metadata.Properties == nil {
+		bom.Metadata.Properties = &[]cdx.Property{}
+	}
+	*bom.Metadata.Properties = append(*bom.Metadata.Properties, cdx.Property{
+		Name:  sbom.OSFallbackProperty,
+		Value: "true",
 	})
 }
 
