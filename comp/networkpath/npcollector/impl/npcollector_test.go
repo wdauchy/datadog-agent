@@ -519,6 +519,83 @@ func Test_NpCollector_runTracerouteForPath_NetflowSourceProduct(t *testing.T) {
 	assert.Equal(t, []string{"team:payments", "env:prod"}, emittedPath.Tags)
 }
 
+func Test_NpCollector_runTracerouteForPath_CorrelationKeyByOrigin(t *testing.T) {
+	const key = "ffa615e17d4fe873604c1377ff8783e2"
+
+	agentConfigs := map[string]any{
+		"network_path.connections_monitoring.enabled":      true,
+		"network_path.netflow_monitoring.enabled":          true,
+		"network_path.collector.monitor_ip_without_domain": true,
+		"network_path.collector.filters":                   []map[string]any{},
+	}
+
+	tests := []struct {
+		name        string
+		origin      payload.PathOrigin
+		expectedKey string
+	}{
+		{name: "network traffic", origin: payload.PathOriginNetworkTraffic, expectedKey: key},
+		{name: "netflow", origin: payload.PathOriginNetflow},
+		{name: "network path integration", origin: payload.PathOriginNetworkPathIntegration},
+		{name: "synthetics", origin: payload.PathOriginSynthetics},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, npCollector := newTestNpCollector(t, agentConfigs, &teststatsd.Client{}, &tracerouteRunner{func(_ctx context.Context, cfg config.Config) (payload.NetworkPath, error) {
+				return payload.NetworkPath{
+					AgentVersion: "1.0.42",
+					Protocol:     cfg.Protocol,
+					Source: payload.NetworkPathSource{
+						Hostname:    "test-hostname",
+						Name:        "test-hostname",
+						DisplayName: "test-hostname",
+					},
+					Destination: payload.NetworkPathDestination{
+						Hostname: cfg.DestHostname,
+						Port:     cfg.DestPort,
+					},
+					Traceroute: payload.Traceroute{
+						Runs: []payload.TracerouteRun{
+							{
+								RunID: "aa-bb-cc",
+								Destination: payload.TracerouteDestination{
+									IPAddress: net.ParseIP("10.0.0.2"),
+									Port:      cfg.DestPort,
+								},
+							},
+						},
+					},
+				}, nil
+			}})
+
+			mockEpForwarder := eventplatformimpl.NewMockEventPlatformForwarder(gomock.NewController(t))
+			npCollector.epForwarder = mockEpForwarder
+
+			var emittedPath payload.NetworkPath
+			mockEpForwarder.EXPECT().SendEventPlatformEventBlocking(
+				gomock.Any(),
+				eventplatform.EventTypeNetworkPath,
+			).DoAndReturn(func(msg *message.Message, _ string) error {
+				require.NoError(t, json.Unmarshal(msg.GetContent(), &emittedPath))
+				return nil
+			}).Times(1)
+
+			npCollector.runTracerouteForPath(&pathteststore.PathtestContext{
+				Pathtest: &common.Pathtest{
+					Hostname:       "10.0.0.2",
+					Port:           443,
+					Protocol:       payload.ProtocolTCP,
+					Origin:         tt.origin,
+					CorrelationKey: key,
+				},
+			})
+
+			assert.Equal(t, tt.expectedKey, emittedPath.CorrelationKey)
+		})
+	}
+}
+
 func Test_NpCollector_runTracerouteForPath_RequiresOrigin(t *testing.T) {
 	agentConfigs := map[string]any{
 		"network_path.connections_monitoring.enabled": true,
@@ -1324,6 +1401,36 @@ func Test_npCollectorImpl_ScheduleMethods_methodGates(t *testing.T) {
 				require.Nil(t, tt.expectedPathtest, "expected pathtest")
 			}
 		})
+	}
+}
+
+func Test_npCollectorImpl_ScheduleNetworkPathTests_StampsCorrelationKey(t *testing.T) {
+	agentConfigs := map[string]any{
+		"network_path.connections_monitoring.enabled":      true,
+		"network_path.collector.monitor_ip_without_domain": true,
+		"network_path.collector.filters":                   []map[string]any{},
+	}
+	_, npCollector := newTestNpCollector(t, agentConfigs, &teststatsd.Client{}, nil)
+
+	networkPaths := npCollector.ScheduleNetworkPathTests(slices.Values([]npmodel.NetworkPathConnection{{
+		SourceHostname: "web-01",
+		Source:         netip.MustParseAddrPort("10.0.0.1:30000"),
+		Dest:           netip.MustParseAddrPort("10.0.0.2:80"),
+		Direction:      model.ConnectionDirection_outgoing,
+		Family:         model.ConnectionFamily_v4,
+		Type:           model.ConnectionType_tcp,
+	}}))
+
+	require.Len(t, networkPaths, 1)
+	require.True(t, networkPaths[0].TestEligible)
+	require.NotEmpty(t, networkPaths[0].CorrelationKey,
+		"an eligible connection with a resolved source hostname must carry a key")
+
+	select {
+	case pathtest := <-npCollector.pathtestInputChan:
+		assert.Equal(t, networkPaths[0].CorrelationKey, pathtest.CorrelationKey)
+	default:
+		require.Fail(t, "expected a scheduled pathtest")
 	}
 }
 

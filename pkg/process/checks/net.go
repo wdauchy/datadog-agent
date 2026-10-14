@@ -221,7 +221,14 @@ func (c *ConnectionsCheck) Cleanup() {
 }
 
 func (c *ConnectionsCheck) scheduleNetworkPath(conns *model.Connections) {
-	c.npCollector.ScheduleNetworkPathTests(func(yield func(npmodel.NetworkPathConnection) bool) {
+	sourceHostname := ""
+	if c.hostInfo != nil {
+		sourceHostname = c.hostInfo.HostName
+	}
+
+	scheduled := make([]*model.Connection, 0, len(conns.Conns))
+
+	networkPaths := c.npCollector.ScheduleNetworkPathTests(func(yield func(npmodel.NetworkPathConnection) bool) {
 		for _, conn := range conns.Conns {
 			srcIP, err := netip.ParseAddr(conn.Laddr.GetIp())
 			if err != nil {
@@ -245,6 +252,7 @@ func (c *ConnectionsCheck) scheduleNetworkPath(conns *model.Connections) {
 				Source:            src,
 				Dest:              dest,
 				TranslatedDest:    transDest,
+				SourceHostname:    sourceHostname,
 				SourceContainerID: conn.Laddr.GetContainerId(),
 				Domain:            getDNSNameForIP(conns, conn.Raddr.GetIp()),
 				Type:              conn.Type,
@@ -255,11 +263,25 @@ func (c *ConnectionsCheck) scheduleNetworkPath(conns *model.Connections) {
 				SentBytes:         conn.LastBytesSent,
 				RecvBytes:         conn.LastBytesReceived,
 			}
+			scheduled = append(scheduled, conn)
 			if !yield(npc) {
 				return
 			}
 		}
 	})
+
+	if len(networkPaths) != 0 && len(networkPaths) != len(scheduled) {
+		log.Errorf("network path decisions misaligned: got %d for %d connections, dropping metadata for this batch",
+			len(networkPaths), len(scheduled))
+		return
+	}
+
+	for i, networkPath := range networkPaths {
+		scheduled[i].NetworkPath = &model.NetworkPath{TestEligible: networkPath.TestEligible}
+		if networkPath.TestEligible {
+			scheduled[i].NetworkPath.CorrelationKey = networkPath.CorrelationKey
+		}
+	}
 }
 
 func getDNSNameForIP(conns *model.Connections, ip string) string {

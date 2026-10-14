@@ -30,12 +30,13 @@ func basicConn(host string, bytes uint64) npmodel.NetworkPathConnection {
 
 func basicConnBytes(host string, sentBytes, recvBytes uint64) npmodel.NetworkPathConnection {
 	return npmodel.NetworkPathConnection{
-		Dest:      netip.MustParseAddrPort(host + ":53"),
-		Type:      model.ConnectionType_udp,
-		Direction: model.ConnectionDirection_outgoing,
-		Family:    model.ConnectionFamily_v4,
-		SentBytes: sentBytes,
-		RecvBytes: recvBytes,
+		Dest:           netip.MustParseAddrPort(host + ":53"),
+		Type:           model.ConnectionType_udp,
+		Direction:      model.ConnectionDirection_outgoing,
+		Family:         model.ConnectionFamily_v4,
+		SourceHostname: "source-host",
+		SentBytes:      sentBytes,
+		RecvBytes:      recvBytes,
 	}
 }
 
@@ -166,15 +167,23 @@ func TestBasicCollectorEmitsOnlyAtWindowBoundary(t *testing.T) {
 	now := MockTimeNow()
 	collector.TimeNowFn = func() time.Time { return now }
 
-	collector.ScheduleNetworkPathTests(slices.Values([]npmodel.NetworkPathConnection{
+	paths := collector.ScheduleNetworkPathTests(slices.Values([]npmodel.NetworkPathConnection{
 		basicConn("10.0.0.1", 1),
 		basicConn("10.0.0.2", 3),
 		basicConn("10.0.0.3", 2),
 		basicConn("10.0.0.4", 4),
 		basicConn("10.0.0.5", 5),
 		basicConn("10.0.0.6", 6),
+		basicConn("10.0.0.1", 0),
 	}))
 	assert.Empty(t, collector.pathtestInputChan)
+
+	// Basic mode continues before scheduleOne, so stamping has to happen on the
+	// way past. The zero-byte observation is discarded by the selector but its
+	// connection is still stamped, with the same key as the earlier one.
+	require.Len(t, paths, 7)
+	assert.NotEmpty(t, paths[6].CorrelationKey)
+	assert.Equal(t, paths[0].CorrelationKey, paths[6].CorrelationKey)
 
 	now = now.Add(basicBootstrapWindow)
 	collector.flushBasicPaths(now)
