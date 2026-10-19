@@ -478,6 +478,10 @@ func newInsertionTestManagerV2(t *testing.T) (*ManagerV2, *[]*model.Event) {
 		kernelVersion:          &kernel.Version{},
 		pathsReducer:           activity_tree.NewPathsReducer(),
 		profiles:               make(map[cgroupModel.WorkloadSelector]*profile.Profile),
+		profilePendingEvents:   make(map[containerutils.CGroupID]*pendingProfile),
+		queueSize:              atomic.NewUint64(0),
+		pendingProfiles:        atomic.NewUint64(0),
+		resolvedCgroups:        make(map[containerutils.CGroupID]struct{}),
 		localStorage:           localStorage,
 		eventFiltering:         make(map[eventFilteringEntry]*atomic.Uint64),
 		insertionErrors:        make(map[insertionErrorKey]*atomic.Uint64),
@@ -506,6 +510,8 @@ func newTestEventV2(eventType model.EventType, imageTag string, variant string) 
 	entry := model.NewPlaceholderProcessCacheEntry(42, 42, false)
 	entry.ContainerContext.ContainerID = containerutils.ContainerID(testContainerID)
 	entry.ContainerContext.Tags = []string{"image_name:" + testImageName, "image_tag:" + imageTag}
+	entry.CGroup.CGroupID = containerutils.CGroupID("/docker/" + testContainerID)
+	entry.CGroup.CGroupPathKey = model.PathKey{Inode: 4242, MountID: 1}
 	entry.FileEvent.PathnameStr = "/usr/bin/proc"
 	entry.FileEvent.BasenameStr = "proc"
 	// a file with an inode but without mount ID would be seen as fileless
@@ -806,3 +812,64 @@ func TestManagerV2_ProcessEventWithoutCWS(t *testing.T) {
 	assert.Empty(t, m.profilePendingEvents)
 	assert.Empty(t, m.resolvedCgroups)
 }
+
+type lazyTimeFieldHandlers struct {
+	*model.FakeFieldHandlers
+}
+
+func (fh *lazyTimeFieldHandlers) ResolveEventTime(ev *model.Event, _ *model.BaseEvent) time.Time {
+	if ev.Timestamp.IsZero() {
+		ev.Timestamp = time.Now()
+	}
+	return ev.Timestamp
+}
+
+func TestManagerV2_queueEventWithLazyTimestampAndDrain(t *testing.T) {
+	m, anomalies := newInsertionTestManagerV2(t)
+
+	ev1 := newTestEventV2(model.ExecEventType, "v1", "known")
+	ev1.Timestamp = time.Time{}
+	ev1.FieldHandlers = &lazyTimeFieldHandlers{FakeFieldHandlers: &model.FakeFieldHandlers{}}
+	ev1.ProcessContext.Process.ContainerContext.Tags = nil
+	ev1.Rules = []*model.MatchedRule{
+		model.NewMatchedRule("rule_1", "1.0", nil, "pol", "1.0"),
+	}
+
+	m.queueEventForTagResolution(ev1, nil)
+	require.Equal(t, uint64(1), m.queueSize.Load())
+	require.Equal(t, uint64(1), m.pendingProfiles.Load())
+
+	ev2 := newTestEventV2(model.ExecEventType, "v1", "new")
+	ev2.Timestamp = time.Time{}
+	ev2.FieldHandlers = &lazyTimeFieldHandlers{FakeFieldHandlers: &model.FakeFieldHandlers{}}
+	ev2.ProcessContext.Process.ContainerContext.Tags = nil
+
+	m.queueEventForTagResolution(ev2, nil)
+	require.Equal(t, uint64(2), m.queueSize.Load())
+	require.Equal(t, uint64(1), m.pendingProfiles.Load())
+
+	ev3 := newTestEventV2(model.BindEventType, "v1", "known")
+	m.processEventWithResolvedTags(ev3)
+
+	assert.Equal(t, uint64(0), m.queueSize.Load())
+	assert.Equal(t, uint64(0), m.pendingProfiles.Load())
+
+	p := m.profiles[testSelector]
+	require.NotNil(t, p)
+	require.NotNil(t, findTestEventNode(p, model.ExecEventType, "known"))
+	require.NotNil(t, findTestEventNode(p, model.ExecEventType, "new"))
+
+	var matchedRules []*model.MatchedRule
+	for _, pn := range p.ActivityTree.ProcessNodes {
+		if pn.Process.FileEvent.PathnameStr == "/usr/bin/known" {
+			matchedRules = pn.MatchedRules
+		}
+	}
+	require.Len(t, matchedRules, 1)
+	assert.Equal(t, "rule_1", matchedRules[0].RuleID)
+
+	require.NotEmpty(t, *anomalies)
+	require.Len(t, (*anomalies)[0].Rules, 1)
+	assert.Equal(t, "rule_1", (*anomalies)[0].Rules[0].RuleID)
+}
+
