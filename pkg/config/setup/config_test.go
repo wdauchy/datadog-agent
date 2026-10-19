@@ -25,6 +25,7 @@ import (
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/config/nodetreemodel"
 	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/generatedsettings"
 	"github.com/DataDog/datadog-agent/pkg/util/defaultpaths"
 	"github.com/DataDog/datadog-agent/pkg/util/scrubber"
 )
@@ -1667,7 +1668,7 @@ additional_endpoints:
 
 func TestServerlessConfigInit(t *testing.T) {
 	conf := newEmptyMockConf(t)
-	initCommonBase(conf)
+	generatedsettings.InitCommonBase(conf)
 
 	// ensure some core configs are declared
 	assert.True(t, conf.IsKnown("api_key"))
@@ -1710,7 +1711,7 @@ func TestServerlessInventoryWrappedCommandEnabled(t *testing.T) {
 				require.NoError(t, os.Unsetenv(envVar))
 			}
 			conf := newEmptyMockConf(t)
-			initCommonBase(conf)
+			generatedsettings.InitCommonBase(conf)
 
 			assert.True(t, conf.IsKnown(key))
 			assert.Equal(t, tt.want, conf.GetBool(key))
