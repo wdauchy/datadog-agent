@@ -37,8 +37,13 @@ func InitSpan(service, name, resource, spanType string, startTime int64, tags ma
 }
 
 // Processor is an interface for processing trace payloads
+//
+// The payload is a v1 (string-indexed) payload, matching the format the
+// trace-agent processes when the convert-traces feature is enabled (the
+// default): internally-generated spans are converted with api.ConvertToIdx
+// before submission.
 type Processor interface {
-	Process(*api.Payload)
+	Process(*api.PayloadV1)
 }
 
 // SubmitSpan submits a completed span to the trace agent
@@ -60,9 +65,14 @@ func SubmitSpan(span *pb.Span, origin string, traceAgent Processor) {
 		Chunks: []*pb.TraceChunk{traceChunk},
 	}
 
-	traceAgent.Process(&api.Payload{
+	// Convert the inferred span to the v1 (string-indexed) payload format so
+	// it is processed by the same v1 path used for receiver-ingested traces
+	// (the default convert-traces behavior). An empty originPayloadVersion
+	// skips the _dd.convertedv1 debug attribute, since this payload was
+	// generated in-process, not converted from an incoming wire format.
+	traceAgent.Process(&api.PayloadV1{
 		Source:        info.NewReceiverStats(true).GetTagStats(info.Tags{}),
-		TracerPayload: tracerPayload,
+		TracerPayload: api.ConvertToIdx(tracerPayload, ""),
 	})
 	log.Debug("Inferred span submitted successfully")
 }
