@@ -502,6 +502,17 @@ func (a *InjectorInstaller) allKnownLauncherPattern() string {
 	return "(" + strings.Join(alts, "|") + ")"
 }
 
+func hostPreloadNeedsRepair(preload []byte) bool {
+	installer := &InjectorInstaller{installPath: injectorPath, tmpfsInjectDir: defaultTmpfsInjectDir}
+	matcher := regexp.MustCompile("^" + installer.allKnownLauncherPattern() + "$")
+	for _, entry := range strings.Fields(string(preload)) {
+		if matcher.MatchString(entry) {
+			return false
+		}
+	}
+	return true
+}
+
 // removeKnownLauncherEntries strips every known launcher entry from ldSoPreload,
 // including surrounding whitespace. Used by deleteLDPreloadConfigContent.
 func (a *InjectorInstaller) removeKnownLauncherEntries(ldSoPreload []byte) []byte {

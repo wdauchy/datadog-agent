@@ -123,6 +123,23 @@ func TestSetupSystemdPreloadUnit(t *testing.T) {
 	}
 }
 
+func TestHostPreloadNeedsRepair(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		preload string
+		want    bool
+	}{
+		{"uninstalled", "", true},
+		{"unrelated preload", "/usr/lib/other.so\n", true},
+		{"persistent launcher", "/opt/datadog-packages/datadog-apm-inject/stable/inject/launcher.preload.so\n", false},
+		{"tmpfs launcher", "/run/datadog-apm-inject/$LIB/launcher.preload.so\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, hostPreloadNeedsRepair([]byte(tc.preload)))
+		})
+	}
+}
+
 func TestSetLDPreloadConfig(t *testing.T) {
 	a := &InjectorInstaller{
 		installPath: "/tmp/stable",
