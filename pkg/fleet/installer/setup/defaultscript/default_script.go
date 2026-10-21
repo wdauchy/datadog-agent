@@ -294,6 +294,13 @@ func installAPMPackages(s *common.Setup) {
 			s.Packages.Install(library, getLibraryVersion(s.Env, library))
 		}
 	}
+	// dd-trace-c is language-agnostic: install it on every Linux host with SSI
+	// enabled, regardless of which languages were requested (except CentOS 6,
+	// which keeps its pinned injector).
+	_, cRequested := s.Env.ApmLibraries[packageToLanguage(common.DatadogAPMLibraryCPackage)]
+	if cRequested || (runtime.GOOS == "linux" && !s.Env.IsCentos6 && apmInstrumentationEnabled) {
+		s.Packages.Install(common.DatadogAPMLibraryCPackage, getLibraryVersion(s.Env, common.DatadogAPMLibraryCPackage))
+	}
 }
 
 // packageToLanguage returns the language of an APM package
