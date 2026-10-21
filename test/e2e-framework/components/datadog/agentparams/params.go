@@ -450,12 +450,12 @@ func WithHostname(hostname string) func(*Params) error {
 	}
 }
 
-// WithV3MetricsDisabled forces the agent onto the V2 series intake API by setting
-// use_v3_api.series.enabled=false.
+// WithV3MetricsDisabled forces the agent onto the V2 series and sketches intake API by
+// setting use_v3_api.series.enabled=false and use_v3_api.sketches.enabled=false.
 func WithV3MetricsDisabled() func(*Params) error {
 	return func(p *Params) error {
 		p.ExtraAgentConfig = append(p.ExtraAgentConfig,
-			pulumi.String("use_v3_api:\n  series:\n    enabled: \"false\"\n"))
+			pulumi.String("use_v3_api:\n  series:\n    enabled: \"false\"\n  sketches:\n    enabled: \"false\"\n"))
 		return nil
 	}
 }

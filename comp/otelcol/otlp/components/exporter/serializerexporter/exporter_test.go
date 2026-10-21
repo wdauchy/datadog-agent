@@ -1666,7 +1666,7 @@ func TestNativeOTelHistogramsGateRequiresV3Sketches(t *testing.T) {
 		_, err := createDDOTMetricsExporter(s, "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "these use v2: http://proxy.example.test;")
-		assert.Contains(t, err.Error(), "serializer_experimental_use_v3_api.sketches.endpoints")
+		assert.Contains(t, err.Error(), "use_v3_api.sketches.enabled")
 	})
 
 	t.Run("not the agent serializer", func(t *testing.T) {

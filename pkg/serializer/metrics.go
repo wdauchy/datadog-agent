@@ -43,13 +43,28 @@ func (k metricsKind) String() string {
 
 // metricsUseV3 decides whether a given resolver should ship the given metrics kind via the v3 intake.
 func metricsUseV3(r resolver.DomainResolver, config config.Component, logger log.Component, kind metricsKind) bool {
-	if kind == metricsKindSeries {
-		return seriesUseV3(r, config, logger)
+	if r.IsMetricToVector() {
+		if kind == metricsKindSeries {
+			return vectorSeriesUseV3(config)
+		}
+		return false
 	}
 
-	return slices.Contains(
-		config.GetStringSlice(fmt.Sprintf("serializer_experimental_use_v3_api.%s.endpoints", kind)),
-		r.GetConfigName())
+	if kind == metricsKindSketches && slices.Contains(
+		config.GetStringSlice("serializer_experimental_use_v3_api.sketches.endpoints"),
+		r.GetConfigName()) {
+		return true
+	}
+
+	endpointsKey := fmt.Sprintf("use_v3_api.%s.endpoints", kind)
+	endpoints := config.GetStringMapString(endpointsKey)
+	if value, ok := endpoints[r.GetConfigName()]; ok {
+		key := fmt.Sprintf("%s.%q", endpointsKey, r.GetConfigName())
+		return evalSeriesV3(key, value, r, logger)
+	}
+
+	enabledKey := fmt.Sprintf("use_v3_api.%s.enabled", kind)
+	return evalSeriesV3(enabledKey, config.GetString(enabledKey), r, logger)
 }
 
 // zlibForcesV2 reports whether the active metrics compressor is zlib, which is incompatible
@@ -89,21 +104,6 @@ func vectorSeriesUseV3(config config.Component) bool {
 		return config.GetBool("observability_pipelines_worker.metrics.use_v3_api.series")
 	}
 	return config.GetBool("vector.metrics.use_v3_api.series")
-}
-
-func seriesUseV3(r resolver.DomainResolver, config config.Component, logger log.Component) bool {
-	if r.IsMetricToVector() {
-		return vectorSeriesUseV3(config)
-	}
-
-	endpointsKey := "use_v3_api.series.endpoints"
-	endpoints := config.GetStringMapString(endpointsKey)
-	if value, ok := endpoints[r.GetConfigName()]; ok {
-		key := fmt.Sprintf("%s.%q", endpointsKey, r.GetConfigName())
-		return evalSeriesV3(key, value, r, logger)
-	}
-
-	return evalSeriesV3("use_v3_api.series.enabled", config.GetString("use_v3_api.series.enabled"), r, logger)
 }
 
 // metricsShadowSampleRate returns the per-flush probability of also sending
@@ -271,7 +271,7 @@ func (s *Serializer) buildPipelinesWithMRF(kind metricsKind, rng prng, mrfFilter
 // SketchesV2Domains returns the configured domains that sketches are sent to over the v2
 // intake, which cannot carry OpenTelemetry histograms. It uses the same routing as SendSketch,
 // but counts the MRF domain even while failover is off, since failover can be turned on later.
-// The names are the ones matched against serializer_experimental_use_v3_api.sketches.endpoints.
+// The names are the ones matched against use_v3_api.sketches.endpoints.
 func (s *Serializer) SketchesV2Domains() []string {
 	var domains []string
 	for conf, ctx := range s.buildPipelinesWithMRF(metricsKindSketches, stdRand{}, metrics.AllowAllFilter{}) {

@@ -239,13 +239,13 @@ func withIntakeHostname(url pulumi.StringInput, shouldSkipSSLValidation pulumi.B
 	}
 }
 
-// WithV3MetricsDisabled forces the Agent onto the V2 series intake API by setting
-// DD_USE_V3_API_SERIES_ENABLED=false.
+// WithV3MetricsDisabled forces the Agent onto the V2 series and sketches intake API by
+// setting DD_USE_V3_API_SERIES_ENABLED=false and DD_USE_V3_API_SKETCHES_ENABLED=false.
 func WithV3MetricsDisabled() func(*Params) error {
 	return func(p *Params) error {
-		return WithAgentServiceEnvVariable(
-			"DD_USE_V3_API_SERIES_ENABLED", pulumi.StringPtr("false"),
-		)(p)
+		p.AgentServiceEnvironment["DD_USE_V3_API_SERIES_ENABLED"] = pulumi.StringPtr("false")
+		p.AgentServiceEnvironment["DD_USE_V3_API_SKETCHES_ENABLED"] = pulumi.StringPtr("false")
+		return nil
 	}
 }
 
