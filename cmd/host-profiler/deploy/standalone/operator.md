@@ -48,9 +48,7 @@ If your cluster does not enforce NetworkPolicy resources, these manifests do not
 
 In [`operator/collector.yaml`](operator/collector.yaml), uncomment the detector and its config. For an explicit name, uncomment `env` and `OTEL_RESOURCE_ATTRIBUTES` in `spec.env`.
 
-Check the detector requirements before enabling one: [EKS](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/resourcedetectionprocessor/README.md#amazon-eks), [AKS](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/resourcedetectionprocessor/README.md#azure-aks), or [GKE](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/resourcedetectionprocessor/README.md#gcp-metadata).
-
-If your CNI enforces these policies for link-local traffic, add an allow rule for the metadata endpoint (typically `169.254.169.254:80`).
+Cloud detector requirements vary by provider. See the [OpenTelemetry resource detection docs](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/resourcedetectionprocessor/README.md#supported-detectors), including the [EKS detector requirements](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/resourcedetectionprocessor/README.md#amazon-eks), before enabling one.
 
 ## Collector health metrics
 
